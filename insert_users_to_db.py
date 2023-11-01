@@ -1,8 +1,22 @@
+import json
+import os
+
 import boto3
+from botocore.exceptions import ClientError
 
 s3_client = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
-table = dynamodb.Table("user_credentials")
+table = dynamodb.Table(os.environ.get("table_name"))
+
+
+def encrypt_data(plaintext_data, key_alias):
+    kms = boto3.client("kms")
+
+    response = kms.describe_key(KeyId=f"alias/{key_alias}")
+    key_id = response["KeyMetadata"]["KeyId"]
+
+    response = kms.encrypt(KeyId=key_id, Plaintext=bytes(plaintext_data, "utf-8"))
+    return response["CiphertextBlob"]
 
 
 def extract_fields_and_insert_into_db(line):
@@ -21,6 +35,11 @@ def extract_fields_and_insert_into_db(line):
                 else:
                     username, domain = email.split("@")
 
+                if password:
+                    password = encrypt_data(
+                        password, os.environ.get("kms_key", "master_key")
+                    )
+
                 try:
                     table.put_item(
                         Item={
@@ -30,8 +49,21 @@ def extract_fields_and_insert_into_db(line):
                             "domain": domain,
                         }
                     )
-                except Exception as e:
-                    print("Exception says: ", e)
+                except ClientError as err:
+                    logger.error(
+                        "Couldn't add record %s. Here's why: %s: %s",
+                        line,
+                        err.response["Error"]["Code"],
+                        err.response["Error"]["Message"],
+                    )
+                    return {
+                        "statusCode": err.response["Error"]["Code"],
+                        "body": json.dumps(
+                            {
+                                "msg": err.response["Error"]["Message"],
+                            },
+                        ),
+                    }
 
 
 def lambda_handler(event, context):
@@ -40,8 +72,6 @@ def lambda_handler(event, context):
     response = s3_client.get_object(Bucket=bucket_name, Key=s3_file_name)
     data = response["Body"].read().decode("utf-8")
     records = data.split("\n")
+
     for record in records:
         extract_fields_and_insert_into_db(record.strip())
-
-
-lambda_handler()
