@@ -30,72 +30,79 @@ def decrypt_password_from_records(items):
 def lambda_handler(event, context):
     operation = event["httpMethod"]
 
-    if operation == "GET":
-        param_key = param_value = ""
-        params = event["queryStringParameters"]
+    if operation != "GET":
+        return {
+            "statusCode": 400,
+            "body": json.dumps(
+                {"msg": "Request type not supported"},
+            ),
+        }
 
-        if "email" in params:
-            param_key = "email"
-            param_value = event["queryStringParameters"]["email"]
-        elif "domain" in params:
-            param_key = "domain"
+    param_key = param_value = ""
+    params = event["queryStringParameters"]
 
-            param_value = event["queryStringParameters"]["domain"]
-        else:
-            return {
-                "statusCode": 400,
-                "body": json.dumps(
-                    {"msg": "Unknown parameter passed"},
+    if "email" in params:
+        param_key = "email"
+        param_value = event["queryStringParameters"]["email"]
+    elif "domain" in params:
+        param_key = "domain"
+
+        param_value = event["queryStringParameters"]["domain"]
+    else:
+        return {
+            "statusCode": 400,
+            "body": json.dumps(
+                {"msg": "Unknown parameter passed"},
+            ),
+        }
+
+    items = []
+    try:
+        filter_expression = Attr(param_key).eq(param_value)
+        response = table.scan(FilterExpression=filter_expression)
+
+        items = response["Items"]
+        decrypt_password_from_records(items)
+
+        while "LastEvaluatedKey" in response:
+            response = table.scan(
+                FilterExpression=boto3.dynamodb.conditions.Attr(param_key).eq(
+                    param_value
                 ),
-            }
-
-        items = []
-        try:
-            filter_expression = Attr(param_key).eq(param_value)
-            response = table.scan(FilterExpression=filter_expression)
-
-            items = response["Items"]
-            decrypt_password_from_records(items)
-
-            while "LastEvaluatedKey" in response:
-                response = table.scan(
-                    FilterExpression=boto3.dynamodb.conditions.Attr(param_key).eq(
-                        param_value
-                    ),
-                    ExclusiveStartKey=response["LastEvaluatedKey"],
-                )
-                data = response["Items"]
-                items.extend(decrypt_password_from_records(data))
-        except ClientError as err:
-            logger.error(
-                "Couldn't scan for records. Here's why: %s: %s",
-                err.response["Error"]["Code"],
-                err.response["Error"]["Message"],
+                ExclusiveStartKey=response["LastEvaluatedKey"],
             )
-            return {
-                "statusCode": err.response["Error"]["Code"],
-                "body": json.dumps(
-                    {
-                        "msg": err.response["Error"]["Message"],
-                    },
-                ),
-            }
-        except Exception as e:
-            return {
-                "statusCode": 400,
-                "body": json.dumps(
-                    {
-                        "msg": str(e),
-                    },
-                ),
-            }
-        else:
-            return {
-                "statusCode": 200,
-                "body": json.dumps(
-                    {
-                        "data": items,
-                        "count": len(items),
-                    },
-                ),
-            }
+            data = response["Items"]
+            items.extend(decrypt_password_from_records(data))
+    except ClientError as err:
+        logger.error(
+            "Couldn't scan for records. Here's why: %s: %s",
+            err.response["Error"]["Code"],
+            err.response["Error"]["Message"],
+        )
+        return {
+            "statusCode": err.response["Error"]["Code"],
+            "body": json.dumps(
+                {
+                    "msg": err.response["Error"]["Message"],
+                },
+            ),
+        }
+    except Exception as e:
+        return {
+            "statusCode": 400,
+            "body": json.dumps(
+                {
+                    "msg": str(e),
+                },
+            ),
+        }
+    else:
+        return {
+            "statusCode": 200,
+            "body": json.dumps(
+                {
+                    "data": items,
+                    "count": len(items),
+                },
+            ),
+        }
