@@ -1,25 +1,33 @@
-import json
+import logging
 import os
 
 import boto3
 from botocore.exceptions import ClientError
 
-s3_client = boto3.client("s3")
-dynamodb = boto3.resource("dynamodb")
-table = dynamodb.Table(os.environ.get("table_name"))
+logger = logging.getLogger(__name__)
 
 
 def encrypt_data(plaintext_data, key_alias):
-    kms = boto3.client("kms")
+    try:
+        kms = boto3.client("kms")
 
-    response = kms.describe_key(KeyId=f"alias/{key_alias}")
-    key_id = response["KeyMetadata"]["KeyId"]
+        response = kms.describe_key(KeyId=f"alias/{key_alias}")
+        key_id = response["KeyMetadata"]["KeyId"]
 
-    response = kms.encrypt(KeyId=key_id, Plaintext=bytes(plaintext_data, "utf-8"))
-    return response["CiphertextBlob"]
+        response = kms.encrypt(
+            KeyId=key_id, Plaintext=bytes(plaintext_data, "utf-8")
+        )
+        return response["CiphertextBlob"]
+    except Exception as e:
+        logger.error(
+            "Error encrypting data {}.".format(
+                plaintext_data,
+            )
+        )
+        raise e
 
 
-def extract_fields_and_insert_into_db(line):
+def extract_fields_and_insert_into_db(table, line):
     email = password = username = domain = ""
     separators = [":", ";", ","]
     for separator in separators:
@@ -56,22 +64,48 @@ def extract_fields_and_insert_into_db(line):
                         err.response["Error"]["Code"],
                         err.response["Error"]["Message"],
                     )
-                    return {
-                        "statusCode": err.response["Error"]["Code"],
-                        "body": json.dumps(
-                            {
-                                "msg": err.response["Error"]["Message"],
-                            },
-                        ),
-                    }
+                    raise err
+
+
+def connect_and_read_data_from_s3(event):
+    try:
+        s3_client = boto3.client("s3")
+
+        bucket_name = event["Records"][0]["s3"]["bucket"]["name"]
+        s3_file_name = event["Records"][0]["s3"]["object"]["key"]
+        response = s3_client.get_object(Bucket=bucket_name, Key=s3_file_name)
+        data = response["Body"].read().decode("utf-8")
+        return data.split("\n")
+    except Exception as e:
+        logger.error(
+            "Error getting object {} from bucket {}.".format(
+                s3_file_name, bucket_name
+            )
+        )
+        raise e
+
+
+def connect_to_table():
+    table = None
+    try:
+        TABLE_NAME = os.environ.get("table_name")
+        dynamodb = boto3.resource("dynamodb")
+        table = dynamodb.Table(TABLE_NAME)
+        table.load()
+    except ClientError as err:
+        logger.error(
+            "Couldn't load the table: %s. Here's why: %s: %s",
+            TABLE_NAME,
+            err.response["Error"]["Code"],
+            err.response["Error"]["Message"],
+        )
+        raise err
+    return table
 
 
 def lambda_handler(event, context):
-    bucket_name = event["Records"][0]["s3"]["bucket"]["name"]
-    s3_file_name = event["Records"][0]["s3"]["object"]["key"]
-    response = s3_client.get_object(Bucket=bucket_name, Key=s3_file_name)
-    data = response["Body"].read().decode("utf-8")
-    records = data.split("\n")
+    table = connect_to_table()
+    records = connect_and_read_data_from_s3(event)
 
     for record in records:
-        extract_fields_and_insert_into_db(record.strip())
+        extract_fields_and_insert_into_db(table, record.strip())

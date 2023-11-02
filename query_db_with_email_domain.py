@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 
 import boto3
@@ -6,18 +7,25 @@ from boto3.dynamodb.conditions import Attr
 from boto3.dynamodb.types import Binary
 from botocore.exceptions import ClientError
 
-dynamodb = boto3.resource("dynamodb")
-table = dynamodb.Table(os.environ.get("table_name"))
+logger = logging.getLogger(__name__)
 
 
 def decrypt_data(encrypted_data):
-    kms = boto3.client("kms")
+    try:
+        kms = boto3.client("kms")
 
-    if isinstance(encrypted_data, Binary):
-        encrypted_data = encrypted_data.value
+        if isinstance(encrypted_data, Binary):
+            encrypted_data = encrypted_data.value
 
-    response = kms.decrypt(CiphertextBlob=encrypted_data)
-    return response["Plaintext"].decode()
+        response = kms.decrypt(CiphertextBlob=encrypted_data)
+        return response["Plaintext"].decode()
+    except Exception as e:
+        logger.error(
+            "Error in decrypting data {}.".format(
+                encrypted_data,
+            )
+        )
+        raise e
 
 
 def decrypt_password_from_records(items):
@@ -25,6 +33,24 @@ def decrypt_password_from_records(items):
         encrypted_password = item.get("password", None)
         if encrypted_password:
             item["password"] = decrypt_data(encrypted_password)
+
+
+def connect_to_table():
+    table = None
+    try:
+        TABLE_NAME = os.environ.get("table_name")
+        dynamodb = boto3.resource("dynamodb")
+        table = dynamodb.Table(TABLE_NAME)
+        table.load()
+    except ClientError as err:
+        logger.error(
+            "Couldn't load the table: %s. Here's why: %s: %s",
+            TABLE_NAME,
+            err.response["Error"]["Code"],
+            err.response["Error"]["Message"],
+        )
+        raise err
+    return table
 
 
 def lambda_handler(event, context):
@@ -55,6 +81,8 @@ def lambda_handler(event, context):
                 {"msg": "Unknown parameter passed"},
             ),
         }
+
+    table = connect_to_table()
 
     items = []
     try:
