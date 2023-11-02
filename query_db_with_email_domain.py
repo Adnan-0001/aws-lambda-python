@@ -72,7 +72,8 @@ def lambda_handler(event, context):
                 ExclusiveStartKey=response["LastEvaluatedKey"],
             )
             data = response["Items"]
-            items.extend(decrypt_password_from_records(data))
+            decrypt_password_from_records(data)
+            items.extend(data)
     except ClientError as err:
         logger.error(
             "Couldn't scan for records. Here's why: %s: %s",
