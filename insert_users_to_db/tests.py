@@ -1,65 +1,114 @@
+import os
+import random
 import unittest
-import boto3
-from moto import mock_s3, mock_dynamodb
-from unittest.mock import patch, MagicMock
-from insert_users_to_db import lambda_handler
-from insert_users_to_db import extract_fields_and_insert_into_db
+
+import moto
+from boto3 import client, resource
+from insert_users_to_db import (
+    connect_and_read_data_from_s3,
+    connect_to_table,
+    extract_fields_and_insert_into_db,
+)
 
 
-class TestLambdaFunction(unittest.TestCase):
-    @mock_s3
-    @mock_dynamodb
-    def test_lambda_handler(self):
-        s3_client = boto3.client("s3", region_name="us-east-1")
-        s3_client.create_bucket(Bucket="test-bucket")
+@moto.mock_dynamodb
+@moto.mock_s3
+@moto.mock_kms
+class TestInsertUsersToDB(unittest.TestCase):
+    def _setup_mock_ddb(self):
+        # Create the mock table
+        self.test_ddb_table_name = "users"
+        os.environ["table_name"] = self.test_ddb_table_name
 
-        test_file_data = (
-            "test1@example.com:password1\ntest2@example.com:password2"
+        dynamodb = resource("dynamodb", region_name="us-east-1")
+        key_schema = [{"AttributeName": "username", "KeyType": "HASH"}]
+        attribute_definitions = [
+            {"AttributeName": "username", "AttributeType": "S"},
+        ]
+        billing_mode = "PAY_PER_REQUEST"
+        dynamodb.create_table(
+            TableName=self.test_ddb_table_name,
+            KeySchema=key_schema,
+            AttributeDefinitions=attribute_definitions,
+            BillingMode=billing_mode,
         )
+
+        dynamodb.Table(self.test_ddb_table_name).wait_until_exists()
+
+    def _setup_mock_s3_bucket(self):
+        self.test_s3_bucket_name = "data-bucket"
+        s3_client = client("s3", region_name="us-east-1")
+        s3_client.create_bucket(Bucket=self.test_s3_bucket_name)
+
+        # Put a file in the bucket
+        self.test_file = "data.txt"
+        self.test_file_content = "Hello, this is a test file."
         s3_client.put_object(
-            Bucket="test-bucket",
-            Key="test-file.txt",
-            Body=test_file_data.encode("utf-8"),
+            Bucket=self.test_s3_bucket_name,
+            Key=self.test_file,
+            Body=self.test_file_content,
         )
 
+    def _setup_mock_kms_client(self):
+        self.kms_client = client("kms", region_name="us-east-1")
+        response = self.kms_client.create_key()
+        key_id = response["KeyMetadata"]["KeyId"]
+
+        # Create an alias for the KMS key
+        alias_name = "alias/testKey"
+        self.kms_client.create_alias(AliasName=alias_name, TargetKeyId=key_id)
+
+        os.environ["kms_key"] = "testKey"
+
+    def setUp(self) -> None:
+        self._setup_mock_ddb()
+        self._setup_mock_s3_bucket()
+        self._setup_mock_kms_client()
+
+        self.table = connect_to_table()
+
+    def test_read_from_s3(self):
         event = {
             "Records": [
                 {
                     "s3": {
-                        "bucket": {"name": "test-bucket"},
-                        "object": {"key": "test-file.txt"},
+                        "bucket": {"name": self.test_s3_bucket_name},
+                        "object": {"key": self.test_file},
                     }
                 }
             ]
         }
+        res = connect_and_read_data_from_s3(event)
+        self.assertEqual(len(res), len(self.test_file_content.split("\n")))
 
-        with patch(
-            "insert_users_to_db.connect_to_table"
-        ) as mock_connect_to_table, patch(
-            "insert_users_to_db.extract_fields_and_insert_into_db"
-        ) as mock_extract_fields_and_insert_into_db:
-            lambda_handler(event, None)
+    def test_extract_and_insert_into_db_pass(self):
+        separators = [":", ";", ","]
+        random_separator = random.choice(separators)
 
-        mock_connect_to_table.assert_called_once()
-        mock_extract_fields_and_insert_into_db.assert_called()
-        assert mock_extract_fields_and_insert_into_db.call_count == 2
+        line = f"gavi25@netvigator.co.uk{random_separator}gavinm"
+        extract_fields_and_insert_into_db(self.table, line)
+        response = self.table.get_item(Key={"username": "gavi25"})
 
-    @patch("insert_users_to_db.encrypt_data")
-    def test_extract_fields_and_insert_into_db(self, mock_encrypt_data):
-        mock_table = MagicMock()
-        line = "test@example.com:password123"
-
-        extract_fields_and_insert_into_db(mock_table, line)
-
-        mock_encrypt_data.assert_called_once_with("password123", "master_key")
-        mock_table.put_item.assert_called_once_with(
-            Item={
-                "username": "test",
-                "email": "test@example.com",
-                "password": mock_encrypt_data.return_value,
-                "domain": "example.com",
-            }
+        self.assertIn(
+            "Item", response, "Item not found in the DynamoDB table."
         )
+
+    def test_extract_and_insert_into_db_fail_no_separator(self):
+        line = "gavi25@netvigator.co.ukgavinm"
+        extract_fields_and_insert_into_db(self.table, line)
+        response = self.table.get_item(Key={"username": "gavi25"})
+
+        self.assertNotIn("Item", response, "Item should not be inserted")
+
+    def test_extract_and_insert_into_db_fail_no_email(self):
+        separators = [":", ";", ","]
+        random_separator = random.choice(separators)
+
+        line = f"gavi25netvigator.co.uk{random_separator}gavinm"
+        extract_fields_and_insert_into_db(self.table, line)
+        response = self.table.get_item(Key={"username": "gavi25"})
+
+        self.assertNotIn("Item", response, "Item should not be inserted")
 
 
 if __name__ == "__main__":
